@@ -53,6 +53,42 @@ async function callGroqWithRetry(model, history, maxRetries = 3) {
     }
 }
 
+// Generates an image with Hugging Face's free Inference API, using FLUX.1-schnell
+// (a fast, free-tier-friendly model). Returns a Buffer of the raw image bytes -
+// ready to hand straight to Baileys.
+// Free tier: no credit card needed. Rate-limited (a few hundred requests/hour, shared
+// pool, not officially published) - if you hit limits often, this is where to look.
+// Throws on failure - caller is responsible for catching and messaging the user.
+async function generateImageHuggingFace(prompt) {
+    const response = await axios.post(
+        'https://router.huggingface.co/hf-inference/models/black-forest-labs/FLUX.1-schnell',
+        {
+            inputs: prompt
+        },
+        {
+            headers: {
+                "Authorization": `Bearer ${process.env.HF_TOKEN}`,
+                "Content-Type": "application/json",
+                "Accept": "image/png" // Without this, axios's default broad Accept header
+                                       // gets rejected by HF's router with a 400 error.
+            },
+            responseType: 'arraybuffer' // the API returns raw image bytes, not JSON
+        }
+    );
+
+    // A successful call returns the image directly as binary data.
+    // If something went wrong, Hugging Face sends JSON instead (e.g. model loading,
+    // rate limit, bad input) - axios still hands that to us as a buffer since we
+    // forced arraybuffer, so we detect it by trying to parse it as JSON/text.
+    const contentType = response.headers['content-type'] || '';
+    if (contentType.includes('application/json')) {
+        const errorJson = JSON.parse(Buffer.from(response.data).toString('utf-8'));
+        throw new Error('Hugging Face returned an error instead of an image: ' + JSON.stringify(errorJson).slice(0, 300));
+    }
+
+    return Buffer.from(response.data);
+}
+
 async function startSupAI() {
     const { state, saveCreds } = await useMultiFileAuthState('supai_auth_session');
 
@@ -133,7 +169,7 @@ async function startSupAI() {
             await sock.sendMessage(remoteJid, { text: "✨ *SupAI Status*: Switched to Llama 4 Scout (Free Mode)!" });
             return;
         }
-        if (text.startsWith('/qwen')) {
+        if (text === '/qwen' || text.startsWith('/qwen ')) {
             userModels[remoteJid] = "qwen/qwen3.6-27b";
             await sock.sendMessage(remoteJid, { text: "✨ *SupAI Status*: Switched to Qwen (Free Mode)!" });
             return;
@@ -148,8 +184,44 @@ async function startSupAI() {
             await sock.sendMessage(remoteJid, { text: "🧹 *SupAI Status*: Conversation memory cleared! Starting fresh." });
             return;
         }
+
+        // 2. Image Generation Command
+        if (text.startsWith('/image')) {
+            const prompt = text.slice('/image'.length).trim();
+            if (!prompt) {
+                await sock.sendMessage(remoteJid, { text: "🎨 Usage: `/image a cat in space wearing a helmet`" });
+                return;
+            }
+            try {
+                await sock.sendPresenceUpdate('composing', remoteJid);
+                const imageBuffer = await generateImageHuggingFace(prompt);
+                await sock.sendMessage(remoteJid, { image: imageBuffer });
+            } catch (error) {
+                const status = error.response?.status;
+                // error.response.data is a Buffer (since we requested arraybuffer) - convert
+                // it to text so we can actually see HF's error message, not just the status code.
+                let errorDetail = error.message;
+                if (error.response?.data) {
+                    try {
+                        errorDetail = Buffer.from(error.response.data).toString('utf-8');
+                    } catch (_) { /* fall back to error.message if this fails */ }
+                }
+                console.error("Hugging Face Image API Error:", status, errorDetail);
+                if (status === 503) {
+                    // Free-tier models "sleep" when idle and need a cold-start, which HF
+                    // reports as 503 rather than a normal error. A retry shortly after works.
+                    await sock.sendMessage(remoteJid, { text: "🥱 The image model is waking up (it sleeps when idle on the free tier). Try again in about 20 seconds." });
+                } else if (status === 429) {
+                    await sock.sendMessage(remoteJid, { text: "⏳ SupAI is generating images too fast right now (free tier limit). Wait a bit and try again." });
+                } else {
+                    await sock.sendMessage(remoteJid, { text: "⚠️ Sorry, SupAI hit an error generating that image. Try again in a moment." });
+                }
+            }
+            return;
+        }
+
         if (text === '/help' || text === '/menu') {
-            const menuText = `👋 *Welcome to SupAI!*\n\nSwitch your AI brain instantly using these commands:\n\n👉 \`/llama\` - Switch to Llama 4 Scout\n👉 \`/qwen\` - Switch to Qwen\n👉 \`/gptoss\` - Switch to GPT-OSS 120B\n👉 \`/reset\` - Clear conversation memory\n\nJust send a normal message to start chatting!`;
+            const menuText = `👋 *Welcome to SupAI!*\n\nSwitch your AI brain instantly using these commands:\n\n👉 \`/llama\` - Switch to Llama 4 Scout\n👉 \`/qwen\` - Switch to Qwen\n👉 \`/gptoss\` - Switch to GPT-OSS 120B\n👉 \`/reset\` - Clear conversation memory\n\n🎨 *Image Generation:*\n👉 \`/image <prompt>\` - Generate an image (e.g. \`/image a cat in space\`)\n\nJust send a normal message to start chatting!`;
             await sock.sendMessage(remoteJid, { text: menuText });
             return;
         }
