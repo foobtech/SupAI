@@ -1,0 +1,16 @@
+# Secrets - never commit these
+.env
+
+# WhatsApp login session - contains live auth credentials
+supai_auth_session/
+
+# Dependencies - regenerated with npm install
+node_modules/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS junk
+.DS_Store
+Thumbs.db
